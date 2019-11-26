@@ -130,7 +130,7 @@ public class P3FaultToleranceTests extends Base475Test {
 
     }
 
-    @Test(timeout = 40000)
+    @Test()
     public void new_leader_all_other_caches_should_be_flushed() throws  Exception{
         TestingClient leader = newClient("Leader");
         blockUntilLeader(leader);
@@ -190,6 +190,7 @@ public class P3FaultToleranceTests extends Base475Test {
         follower.getValue(a1); // value cached in follower
         follower2.getValue(a1); // value cached in follower
         follower.suspendAccessToZK();
+        follower.suspendAccessToSelf();
         blockUntilMemberLeaves(follower);
         follower2.setValue(a1,"newVal");
         Assert.assertTrue(follower2.getValue(a1).equals("newVal"));
@@ -213,6 +214,20 @@ public class P3FaultToleranceTests extends Base475Test {
         follower.suspendAccessToSelf();
         follower2.setValue(a1,"newVal");
         Assert.assertTrue(follower2.getValue(a1).equals("newVal"));
+    }
+
+    // after first submission
+
+    @Test(expected = IOException.class)
+    public void testReadingWhileLeaderNotInZKAndNoOtherNodes() throws Exception{
+        TestingClient leader = newClient("Leader");
+        blockUntilLeader(leader);
+        String key = getNewKey();
+        String val = getNewValue();
+        leader.setValue(key,val);
+        leader.suspendAccessToZK();
+        blockUntilMemberLeaves(leader);
+        leader.getValue(key);
     }
 
 }

@@ -30,16 +30,17 @@ public class KVStore extends AbstractKVStore {
     // connections currently maintained by zookeeper
     private TreeCache connectedClients;
     // leader: hashmap where data is stored, follower: hashmap where a subset of the leaders data is cached
-    private ConcurrentHashMap<String, String> localCache = new ConcurrentHashMap<>();
+    private volatile ConcurrentHashMap<String, String> localCache = new ConcurrentHashMap<>();
     // hashmap mantained by leader to know who has cached what: key = string key and value = list of clients that have it cached
-    private ConcurrentHashMap<String, HashSet<String>> keys_cached_in_followers = new ConcurrentHashMap<>();
+    private volatile ConcurrentHashMap<String, HashSet<String>> keys_cached_in_followers = new ConcurrentHashMap<>();
     // locks for reading and writing same key
-    private ConcurrentHashMap<String, ReentrantReadWriteLock> locks = new ConcurrentHashMap<>();
+    private volatile ConcurrentHashMap<String, ReentrantReadWriteLock> locks = new ConcurrentHashMap<>();
+    // nodes that have been disconnected
+    private volatile ConcurrentHashMap<String,String> disconnectedNodes = new ConcurrentHashMap<>();
 
     // flag to check if we are still connected
-    private boolean connected = true;
-    private boolean leaderConnected = true;
-    private String currentLeader = "";
+    private volatile boolean connected = true;
+    private volatile String currentLeader = "";
 
     /**
      * This callback is invoked once your client has started up and published an RMI endpoint.
@@ -62,22 +63,26 @@ public class KVStore extends AbstractKVStore {
 
         connectedClients.getListenable().addListener((client, event) -> {
 //            System.out.println("client in " + getLocalConnectString() + " detected change in connected clients: " + event);
-            if (event.getType().equals(TreeCacheEvent.Type.CONNECTION_SUSPENDED) && getLocalConnectString().equals(leaderLatch.getLeader().getId())) {
-                leaderConnected = false;
-            } else if (event.getType().equals(TreeCacheEvent.Type.CONNECTION_RECONNECTED) && getLocalConnectString().equals(leaderLatch.getLeader().getId())) {
-                leaderConnected = true;
+            if (event.getType().equals(TreeCacheEvent.Type.NODE_REMOVED) ) {
+                disconnectedNodes.put(event.getData().getPath(),"");
+            } else if (event.getType().equals(TreeCacheEvent.Type.NODE_ADDED) ) {
+                disconnectedNodes.remove(event.getData().getPath());
             }
         });
 
         leaderLatch.addListener(new LeaderLatchListener() {
             @Override
             public void isLeader() {
+                // became leader reset
+                keys_cached_in_followers = new ConcurrentHashMap<>();
+                disconnectedNodes = new ConcurrentHashMap<>();
             }
 
             @Override
             public void notLeader() {
                 // Not the leader any more delete current information about cached data
                 keys_cached_in_followers = new ConcurrentHashMap<>();
+                disconnectedNodes = new ConcurrentHashMap<>();
             }
         });
 
@@ -106,7 +111,12 @@ public class KVStore extends AbstractKVStore {
      */
     @Override
     public String getValue(String key) throws IOException {
-        // check if leader has changed since previouse call to get
+        // if we lost connection to zk throw exception
+        if (!connected) {// need to check connection here
+            throw new IOException("client at " + getLocalConnectString() + "has disconnected from zookeeper");
+        }
+
+        // check if leader has changed since previous call to get safety maintained by method call
         fix_cache();
 
         // if we have the value cached return it
@@ -114,11 +124,6 @@ public class KVStore extends AbstractKVStore {
             return localCache.get(key);
         }
         // if we do not have it cached we need to ask the leader for it
-
-        // if we lost connection to zk throw exception
-        if (!connected) {// need to check connection here
-            throw new IOException("client at " + getLocalConnectString() + "has disconnected from zookeeper");
-        }
 
         // connect to the leader
         boolean got_connection_to_leader = false;
@@ -136,6 +141,7 @@ public class KVStore extends AbstractKVStore {
             localCache.put(key, value);
         }
         return value;
+
     }
 
     /**
@@ -147,21 +153,23 @@ public class KVStore extends AbstractKVStore {
      */
     @Override
     public void setValue(String key, String value) throws IOException {
-            // flush cache if necessary
-            fix_cache();
 
             // check that we have not lost connection to zk
             if (!connected) {// need to check connection here
                 throw new IOException("client at " + getLocalConnectString() + "has disconnected from zookeeper");
             }
 
+            // flush cache if necessary safety mantained by this method
+            fix_cache();
+
             // connect to the leader
             boolean got_connection_to_leader = false;
-            while(!got_connection_to_leader) {
+            while (!got_connection_to_leader) {
                 try {
                     leaderKVStoreConnection = connectToKVStore(leaderLatch.getLeader().getId());
                     got_connection_to_leader = true;
-                }catch (Exception e){}
+                } catch (Exception e) {
+                }
             } // retry until we get a connection allows time for getting a new leader as well
 
             // ask leader to change the value of the key
@@ -223,6 +231,10 @@ public class KVStore extends AbstractKVStore {
      */
     @Override
     public void setValue(String key, String value, String fromID) throws IOException {
+        if (!connected){
+            throw  new IOException("Leader not connected to zookeeper");
+        }
+
         // mantaining safety cannot write same key at the same time
         ReentrantReadWriteLock.WriteLock key_lock;
         synchronized (this) {
@@ -246,16 +258,15 @@ public class KVStore extends AbstractKVStore {
                     ArrayList<String> contacted = new ArrayList<String>();
                     for (String id : followers) {
                         try {
-                            IKVStore follower_connection = connectToKVStore(id);
-                            follower_connection.invalidateKey(key);
-                            contacted.add(id);
-
-                        } catch (Exception e) {
-                            if(!(connectedClients.getCurrentChildren(ZK_MEMBERSHIP_NODE).containsKey(id))){
-                                // this memeber got disconnected from zk its okay if we did not get invalidate message
+                            if(disconnectedNodes.containsKey(ZK_MEMBERSHIP_NODE+"/"+id)){
+                                contacted.add(id);
+                            }else {
+                                IKVStore follower_connection = connectToKVStore(id);
+                                follower_connection.invalidateKey(key);
                                 contacted.add(id);
                             }
-                        }
+
+                        } catch (Exception e) { }
                     }
                     followers.removeAll(contacted);
                 }
@@ -281,7 +292,9 @@ public class KVStore extends AbstractKVStore {
     @Override
     public void invalidateKey(String key) throws RemoteException {
         // our way of invalidating the key is to remove it from our local cache
-        localCache.remove(key);
+        synchronized (this) { // control multiple invalidates
+            localCache.remove(key);
+        }
     }
 
     /**
@@ -309,15 +322,19 @@ public class KVStore extends AbstractKVStore {
 
     private void fix_cache(){
         // check if leader has changed since previous call to get
-        try{
-            String syncLeader = leaderLatch.getLeader().getId();
-            if(!(currentLeader.equals(syncLeader)) && !(syncLeader.equals(getLocalConnectString())) ){
-                // if leader changed and this client is not it, flush the cache
-                localCache = new ConcurrentHashMap<>();
-            }
-            currentLeader = syncLeader; // update who is the leader
+        synchronized(this){ // avoid multiple threads modifyng each others current leader
+            try {
+                String syncLeader = leaderLatch.getLeader().getId();
+                if (!(currentLeader.equals(syncLeader)) && !(syncLeader.equals(getLocalConnectString()))) {
+                    // if leader changed and this client is not it, flush the cache
+                    localCache = new ConcurrentHashMap<>();
+                }
+                currentLeader = syncLeader; // update who is the leader
 
-        }catch (Exception e){e.printStackTrace(); }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
 
     }
 
